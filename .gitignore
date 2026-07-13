@@ -3,5 +3,10 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-data/*.db
 .streamlit/secrets.toml
+
+# data/prospects.db is intentionally tracked (not ignored): the scheduled
+# GitHub Actions workflow commits fresh enrichment results here, and
+# Streamlit Community Cloud auto-redeploys on push — that's what makes the
+# dashboard "always on" without running a dedicated server. See
+# .github/workflows/refresh.yml.
