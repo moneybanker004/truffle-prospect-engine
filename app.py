@@ -55,8 +55,17 @@ def load_prospects():
     return db.get_all_prospects_with_scores()
 
 
+@st.cache_data(ttl=3600)
+def load_standalone_locations():
+    db.init_db()
+    return db.get_standalone_locations()
+
+
 def run_enrichment():
-    with st.spinner("Enriching all 10 seed prospects (Google Places, job boards, news)..."):
+    with st.spinner(
+        "Enriching all 10 seed prospects (Google Places, job boards, news) "
+        "and scanning for independent restaurant discoveries..."
+    ):
         run_pipeline(SEED_PROSPECTS, verbose=False)
     st.cache_data.clear()
 
@@ -236,6 +245,80 @@ with right:
         with st.expander(f"Flagged review snippets ({len(neg_examples)})"):
             for ex in neg_examples:
                 st.write(f"> {ex}")
+
+individual_locations = db.get_locations_for_prospect(selected["id"])
+if individual_locations:
+    st.divider()
+    st.subheader("Individual locations")
+    st.caption(
+        f"{selected['short_name']}'s own {len(individual_locations)} matched locations, each scored on "
+        "its own reviews only (not the 5-signal group score above) — surfaces a single strained "
+        "restaurant even inside a group that looks low-priority overall."
+    )
+    loc_df = pd.DataFrame([
+        {
+            "Restaurant": loc["name"],
+            "Rating": loc.get("rating"),
+            "Reviews sampled": loc.get("reviews_sampled"),
+            "Review-pain score": loc.get("pain_score"),
+        }
+        for loc in individual_locations
+    ])
+    st.dataframe(
+        loc_df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Review-pain score": st.column_config.ProgressColumn(
+                "Review-pain score", min_value=0, max_value=100, format="%.0f"
+            ),
+        },
+    )
+
+# ---------------------------------------------------------------------------
+# Independent restaurant discovery (beta) — standalone spots outside the 10
+# seed groups, found via Google's own "best new / trending" style rankings.
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("🔎 Independent restaurant discovery (beta)")
+st.caption(
+    "Standalone NYC restaurants outside the 10 seed groups, surfaced by Google Places' own ranking "
+    "for \"best new / trending\" restaurant queries — not a verified opening-date list (Places has no "
+    "such field), but every result below is a real, currently-operating, food-category business. "
+    "These tend to be buzzy recent openings under high demand — worth outreach because they're likely "
+    "still choosing their ops stack, not because reviews show strain yet (they usually don't, this early)."
+)
+
+standalone = load_standalone_locations()
+if not standalone:
+    st.info("No independent discoveries yet — click **Run / refresh enrichment** above to scan for them.")
+else:
+    disc_df = pd.DataFrame([
+        {
+            "Restaurant": loc["name"],
+            "Rating": loc.get("rating"),
+            "Reviews sampled": loc.get("reviews_sampled"),
+            "Review-pain score": loc.get("pain_score"),
+            "Discovered via": loc.get("discovered_via"),
+        }
+        for loc in standalone
+    ])
+    st.dataframe(
+        disc_df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Review-pain score": st.column_config.ProgressColumn(
+                "Review-pain score", min_value=0, max_value=100, format="%.0f"
+            ),
+        },
+    )
+    st.download_button(
+        "⬇️ Export discoveries CSV",
+        disc_df.to_csv(index=False).encode("utf-8"),
+        file_name="truffle_independent_discoveries.csv",
+        mime="text/csv",
+    )
 
 st.divider()
 st.caption(

@@ -79,6 +79,28 @@ CREATE TABLE IF NOT EXISTS history (
     total_score REAL,
     recorded_at TEXT
 );
+
+-- Individual restaurants, at a finer grain than the parent group.
+-- prospect_id set  -> one of the 10 seed groups' own locations (e.g. one of
+--                     Major Food Group's 6 restaurants), scored on its own
+--                     reviews so a single strained location surfaces even if
+--                     the group overall looks low-priority.
+-- prospect_id NULL -> an independently-discovered standalone restaurant, not
+--                     part of any seed group. See src/discovery.py.
+CREATE TABLE IF NOT EXISTS locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prospect_id INTEGER REFERENCES prospects(id),
+    place_id TEXT UNIQUE NOT NULL,
+    name TEXT,
+    rating REAL,
+    reviews_sampled INTEGER,
+    negative_review_hits INTEGER,
+    negative_review_examples TEXT,     -- JSON list
+    pain_score REAL,                   -- 0-100, review-density based only — see scoring.score_location_pain
+    discovered_via TEXT,               -- e.g. a NewsAPI headline, for standalone discoveries
+    source TEXT DEFAULT 'unavailable', -- 'google_places_api' or 'unavailable'
+    last_seen_at TEXT
+);
 """
 
 
@@ -181,6 +203,55 @@ def get_location_growth(prospect_id: int) -> dict | None:
         "latest_date": last["recorded_at"],
         "delta": last["location_count"] - first["location_count"],
     }
+
+
+def save_location(prospect_id: int | None, location: dict):
+    """
+    Upsert one individual restaurant's own review-based data, keyed on its
+    Google place_id. prospect_id=None for a standalone (non-group) discovery.
+    """
+    data = dict(location)
+    data["prospect_id"] = prospect_id
+    data["last_seen_at"] = datetime.now(timezone.utc).isoformat()
+    if not isinstance(data.get("negative_review_examples"), str):
+        data["negative_review_examples"] = json.dumps(data.get("negative_review_examples") or [])
+
+    columns = list(data.keys())
+    placeholders = ", ".join(["?"] * len(columns))
+    update_clause = ", ".join([f"{c}=excluded.{c}" for c in columns if c != "place_id"])
+    with get_conn() as conn:
+        conn.execute(
+            f"""INSERT INTO locations ({", ".join(columns)}) VALUES ({placeholders})
+                ON CONFLICT(place_id) DO UPDATE SET {update_clause}""",
+            [data[c] for c in columns],
+        )
+
+
+def get_locations_for_prospect(prospect_id: int) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM locations WHERE prospect_id = ? ORDER BY pain_score DESC NULLS LAST",
+            (prospect_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_standalone_locations() -> list[dict]:
+    """Independently-discovered restaurants not tied to any of the 10 seed groups."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM locations WHERE prospect_id IS NULL ORDER BY pain_score DESC NULLS LAST"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_known_group_place_ids() -> set[str]:
+    """place_ids already tracked under one of the 10 seed groups — used to
+    dedupe independent discovery so a group's own restaurant can't also show
+    up as a separate 'independent' find."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT place_id FROM locations WHERE prospect_id IS NOT NULL").fetchall()
+        return {r["place_id"] for r in rows}
 
 
 def get_all_prospects_with_scores() -> list[dict]:

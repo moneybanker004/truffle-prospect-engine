@@ -61,7 +61,22 @@ def _empty_result(reason: str = "unavailable") -> dict:
         "negative_review_hits": None,
         "negative_review_examples": [],
         "review_source": reason,
+        "locations": [],
     }
+
+
+def negative_hits_for_reviews(reviews: list[dict]) -> list[str]:
+    """Keyword hit AND the reviewer's own rating ≤3 — see NEGATIVE_REVIEW_MAX_RATING."""
+    hits = []
+    for review in reviews:
+        review_text = review["text"]
+        review_rating = review.get("rating")
+        lowered = review_text.lower()
+        keyword_hit = any(keyword in lowered for keyword in NEGATIVE_REVIEW_KEYWORDS)
+        rating_confirms_complaint = review_rating is not None and review_rating <= NEGATIVE_REVIEW_MAX_RATING
+        if keyword_hit and rating_confirms_complaint:
+            hits.append(review_text[:200])
+    return hits
 
 
 def _brand_name(query: str) -> str:
@@ -86,7 +101,7 @@ def _is_relevant_match(display_name: str, brand_name: str) -> bool:
     return bn in dn or dn in bn
 
 
-def _is_food_business(place: dict) -> bool:
+def is_food_business(place: dict) -> bool:
     """True if Google categorizes this place as a restaurant/bar/cafe/etc.
 
     Filters out same-name non-food businesses a loose text match can pull in
@@ -158,7 +173,7 @@ def enrich_group(search_query: str, api_key: str, location_queries: list[str] | 
                 continue
             if place.get("businessStatus") == "CLOSED_PERMANENTLY":
                 continue
-            if not _is_food_business(place):
+            if not is_food_business(place):
                 continue
             display_name = place.get("displayName", {}).get("text", "")
             # Only filter by name relevance in per-concept mode. The single
@@ -176,6 +191,7 @@ def enrich_group(search_query: str, api_key: str, location_queries: list[str] | 
     location_names = []
     ratings = []
     all_reviews = []
+    locations = []  # per-place breakdown, for individual-location scoring
 
     for place in places:
         display_name = place.get("displayName", {}).get("text", "")
@@ -185,21 +201,20 @@ def enrich_group(search_query: str, api_key: str, location_queries: list[str] | 
             ratings.append(place["rating"])
 
         place_id = place.get("id")
-        if place_id:
-            all_reviews.extend(get_place_reviews(place_id, api_key))
+        place_reviews = get_place_reviews(place_id, api_key) if place_id else []
+        all_reviews.extend(place_reviews)
+        place_negative_hits = negative_hits_for_reviews(place_reviews)
 
-    negative_hits = []
-    for review in all_reviews:
-        review_text = review["text"]
-        review_rating = review.get("rating")
-        lowered = review_text.lower()
-        keyword_hit = any(keyword in lowered for keyword in NEGATIVE_REVIEW_KEYWORDS)
-        # Require the reviewer's own rating to actually be low — otherwise
-        # "waited all winter for this dish" (5 stars) counts as a complaint
-        # just because it contains "waited". See NEGATIVE_REVIEW_MAX_RATING.
-        rating_confirms_complaint = review_rating is not None and review_rating <= NEGATIVE_REVIEW_MAX_RATING
-        if keyword_hit and rating_confirms_complaint:
-            negative_hits.append(review_text[:200])
+        locations.append({
+            "place_id": place_id,
+            "name": display_name,
+            "rating": place.get("rating"),
+            "reviews_sampled": len(place_reviews),
+            "negative_review_hits": len(place_negative_hits),
+            "negative_review_examples": place_negative_hits[:3],
+        })
+
+    negative_hits = negative_hits_for_reviews(all_reviews)
 
     # Fallback (no concept list) mode often just returns the group's own
     # corporate Google Business Profile entry rather than a real restaurant
@@ -216,4 +231,5 @@ def enrich_group(search_query: str, api_key: str, location_queries: list[str] | 
         "negative_review_hits": len(negative_hits),
         "negative_review_examples": negative_hits[:5],
         "review_source": "google_places_api" if all_reviews else "unavailable",
+        "locations": locations,
     }

@@ -66,6 +66,21 @@ def score_negative_reviews(negative_hits: int | None, reviews_sampled: int | Non
     return round(WEIGHT_NEGATIVE_REVIEWS * min(density, 1.0), 1)
 
 
+def score_location_pain(negative_hits: int | None, reviews_sampled: int | None) -> float | None:
+    """
+    A single restaurant's own 0-100 review-pain score — deliberately a
+    narrower, different metric than the 5-signal group-level score above.
+    "Location count," "hiring," and "press" are properties of the parent
+    company, not of one restaurant, so blending them into a fake per-location
+    weighted score would overstate what's actually known about that one
+    place. Returns None (not 0) when there's no review sample to judge from —
+    0 would wrongly claim "confirmed no pain."
+    """
+    if not reviews_sampled:
+        return None
+    return round(100 * min((negative_hits or 0) / reviews_sampled, 1.0), 1)
+
+
 def detect_vendor_mention(texts: list[str]) -> tuple[bool, str | None]:
     """Scan a list of raw text blobs (job postings, press) for a named BOH/POS vendor."""
     for text in texts:

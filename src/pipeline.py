@@ -4,13 +4,15 @@ scoring for one or all seed prospects, and persists results to SQLite.
 """
 
 import json
+import sys
 
 from src import db
 from src.config import GOOGLE_PLACES_API_KEY, NEWSAPI_KEY, SEED_PROSPECTS
-from src.enrichment.google_places import enrich_group
+from src.discovery import discover_independent_restaurants
+from src.enrichment.google_places import enrich_group, negative_hits_for_reviews
 from src.enrichment.jobs_search import enrich_hiring_signal
 from src.enrichment.news_search import enrich_expansion_signal
-from src.scoring import detect_vendor_mention, score_prospect
+from src.scoring import detect_vendor_mention, score_location_pain, score_prospect
 
 
 def enrich_and_score_prospect(seed: dict, verbose: bool = False) -> dict:
@@ -66,6 +68,10 @@ def enrich_and_score_prospect(seed: dict, verbose: bool = False) -> dict:
         sources = [s for s in (hiring_data["hiring_source"], news_data["expansion_source"]) if s != "unavailable"]
         vendor_source = "+".join(sources)
 
+    # Per-location breakdown isn't a column on the enrichment table (it's a
+    # list of restaurants, not a scalar) — pull it out and persist separately.
+    individual_locations = places_data.pop("locations", [])
+
     enrichment = {
         **places_data,
         **hiring_data,
@@ -75,6 +81,20 @@ def enrich_and_score_prospect(seed: dict, verbose: bool = False) -> dict:
         "vendor_source": vendor_source,
     }
     db.save_enrichment(prospect_id, enrichment)
+
+    for loc in individual_locations:
+        if not loc.get("place_id"):
+            continue
+        db.save_location(prospect_id, {
+            "place_id": loc["place_id"],
+            "name": loc["name"],
+            "rating": loc.get("rating"),
+            "reviews_sampled": loc.get("reviews_sampled"),
+            "negative_review_hits": loc.get("negative_review_hits"),
+            "negative_review_examples": loc.get("negative_review_examples", []),
+            "pain_score": score_location_pain(loc.get("negative_review_hits"), loc.get("reviews_sampled")),
+            "source": "google_places_api",
+        })
 
     score = score_prospect(enrichment)
     db.save_score(prospect_id, score)
@@ -86,11 +106,47 @@ def enrich_and_score_prospect(seed: dict, verbose: bool = False) -> dict:
     return {"prospect_id": prospect_id, "enrichment": enrichment, "score": score}
 
 
-def run_pipeline(seeds: list[dict] = None, verbose: bool = True) -> list[dict]:
+def run_discovery(verbose: bool = True) -> list[dict]:
+    """
+    Finds standalone NYC restaurants not tied to any of the 10 seed groups.
+    See src/discovery.py for how ("best new / trending" Places queries,
+    verified real/open/food-category, deduped against known group locations).
+    """
+    known_ids = db.get_known_group_place_ids()
+    discovered = discover_independent_restaurants(GOOGLE_PLACES_API_KEY, known_ids, verbose=verbose)
+
+    for place in discovered:
+        negative_hits = negative_hits_for_reviews(place["reviews"])
+        db.save_location(None, {
+            "place_id": place["place_id"],
+            "name": place["name"],
+            "rating": place.get("rating"),
+            "reviews_sampled": place.get("reviews_sampled"),
+            "negative_review_hits": len(negative_hits),
+            "negative_review_examples": negative_hits[:3],
+            "pain_score": score_location_pain(len(negative_hits), place.get("reviews_sampled")),
+            "discovered_via": place.get("discovered_via"),
+            "source": "google_places_api",
+        })
+        if verbose:
+            print(f"[discovery] {place['name']} — pain score computed, saved")
+
+    return discovered
+
+
+def run_pipeline(seeds: list[dict] = None, verbose: bool = True, discover: bool = True) -> list[dict]:
     db.init_db()
     seeds = seeds if seeds is not None else SEED_PROSPECTS
-    return [enrich_and_score_prospect(seed, verbose=verbose) for seed in seeds]
+    results = [enrich_and_score_prospect(seed, verbose=verbose) for seed in seeds]
+    if discover:
+        run_discovery(verbose=verbose)
+    return results
 
 
 if __name__ == "__main__":
+    # Restaurant names/reviews can contain characters outside Windows' default
+    # console codepage (e.g. Vietnamese diacritics) — reconfigure so a verbose
+    # print never crashes the run; the actual DB writes are unaffected either way.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     run_pipeline()
